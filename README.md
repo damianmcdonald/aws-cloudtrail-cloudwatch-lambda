@@ -6,7 +6,7 @@ The `aws-cloudtrail-cloudwatch-lambda` project demonstrates the creation of a Cl
 
 The project architecture is depicted in the diagram below:
 
-![Architecture diagram](assets/architecture.png)
+![Architecture diagram](.assets/architecture.png)
 
 # Prerequisites
 
