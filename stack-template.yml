@@ -1,0 +1,224 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+    'AWS CloudTrail to CloudWatch logs with Metrics/Alarm/Lambda'
+
+#########################################################
+#                                                       # 
+#        Start of Parameters section                    #
+#                                                       #
+#########################################################
+Parameters:
+    LogGroupName:
+        Type: 'String'
+        Description: Name of the Log Group to be created
+        Default: SecurityTrailGroup
+    RetentionPeriod:
+        Type: 'Number'
+        Description: Retention Period of the log group in days
+        ConstraintDescription: Value must be a positive whole number
+        Default: 1
+    TrailName:
+        Type: 'String'
+        Description: Name of the Trail to be created
+        Default: SecurityTrail
+    PrimaryTagName:
+        Description: Name to be used as the primary name tag. For identification purposes.
+        Type: 'String'
+        Default: AWS-CT-2-CW
+
+#########################################################
+#                                                       # 
+#        Start of Resources section                     #
+#                                                       #
+#########################################################
+Resources:
+
+    # create S3 Bucket
+    S3Bucket:
+        Type: AWS::S3::Bucket
+        Properties:
+          Tags:
+            - Key: Name
+              Value: !Join ['', ['S3-Bucket-', !Ref 'PrimaryTagName']]
+            - Key: Stack
+              Value: !Ref PrimaryTagName
+
+    # create Cloud Watch Log Group
+    CloudWatchLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties: 
+          LogGroupName: !Ref LogGroupName
+          RetentionInDays: !Ref RetentionPeriod
+
+    # https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-required-policy-for-cloudwatch-logs.html
+    # arn:aws:logs:us-east-2:accountID:log-group:log_group_name:log-stream:CloudTrail_log_stream_name_prefix*"
+    # create the Role to allow CloudTrail to write to Cloud Watch Logs
+    CloudWatchLogRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                - Effect: Allow
+                  Principal:
+                    Service:
+                    - cloudtrail.amazonaws.com
+                  Action:
+                  - sts:AssumeRole
+            Path: "/"
+            Policies:
+              - PolicyName: CloudWatchLogPolicy
+                PolicyDocument:
+                  Version: '2012-10-17'
+                  Statement:
+                  - Effect: Allow
+                    Action:
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                    Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${CloudWatchLogGroup}:log-stream:${AWS::AccountId}_CloudTrail_${AWS::Region}*
+              - PolicyName: CloudWatchS3Policy
+                PolicyDocument:
+                  Version: '2012-10-17'
+                  Statement:
+                  - Effect: Allow
+                    Action:
+                    - s3:AbortMultipartUpload
+                    - s3:GetBucketLocation
+                    - s3:GetObject
+                    - s3:ListBucket
+                    - s3:ListBucketMultipartUploads
+                    - s3:PutObject
+                    Resource: !Sub arn:aws:s3:::${S3Bucket}/AWSLogs/${AWS::AccountId}/*
+
+    # create the S3 bucket policy to allow CloudTrail to write its logs to S3
+    BucketPolicy: 
+        Type: AWS::S3::BucketPolicy
+        Properties: 
+            Bucket: !Ref S3Bucket
+            PolicyDocument: 
+              Version: "2012-10-17"
+              Statement: 
+                - 
+                  Sid: "AWSCloudTrailAclCheck"
+                  Effect: "Allow"
+                  Principal: 
+                    Service: "cloudtrail.amazonaws.com"
+                  Action: "s3:GetBucketAcl"
+                  Resource: !Sub arn:aws:s3:::${S3Bucket}
+                - 
+                  Sid: "AWSCloudTrailWrite"
+                  Effect: "Allow"
+                  Principal: 
+                    Service: "cloudtrail.amazonaws.com"
+                  Action: "s3:PutObject"
+                  Resource: !Sub arn:aws:s3:::${S3Bucket}/AWSLogs/${AWS::AccountId}/*
+
+    # create the Cloud Trail
+    SecurityTrail:
+        Type: AWS::CloudTrail::Trail
+        Properties: 
+          CloudWatchLogsLogGroupArn: !GetAtt [ "CloudWatchLogGroup", "Arn" ]
+          CloudWatchLogsRoleArn: !GetAtt [ "CloudWatchLogRole", "Arn" ]
+          EnableLogFileValidation: false
+          IncludeGlobalServiceEvents: true
+          IsLogging: true
+          IsMultiRegionTrail: false
+          S3BucketName: !Ref S3Bucket
+          Tags:
+            - Key: Name
+              Value: !Join ['', ['SecurityTrail-', !Ref 'PrimaryTagName']]
+            - Key: Stack
+              Value: !Ref PrimaryTagName
+          TrailName: !Ref TrailName
+
+    LambdaExecutionRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                - Effect: Allow
+                  Principal:
+                    Service:
+                    - lambda.amazonaws.com
+                  Action:
+                  - sts:AssumeRole
+            Path: "/"
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+    # Lambda function to be invoked by Cloud Trail to Cloud Watch rule
+    SecurityLambda:
+        Type: AWS::Lambda::Function
+        Properties:
+          Runtime: nodejs12.x
+          Role: !GetAtt LambdaExecutionRole.Arn
+          Handler: index.handler
+          Code:
+            ZipFile: |
+              var aws = require('aws-sdk')
+              exports.handler = function(event, context) {
+                  console.log("SecurityLambda executing.")
+                  console.log("REQUEST RECEIVED:\n" + JSON.stringify(event))
+                  console.log("SecurityLambda exiting.")
+              }
+          Description: Sample style function to be invoked by CloudWatch rule.
+
+    # create Cloud Watch rule
+    EventRule: 
+      Type: AWS::Events::Rule
+      Properties: 
+        Description: EC2 Cloud Trail Rule
+        EventPattern: 
+          source: 
+            - "aws.ec2"
+          detail-type: 
+            - "EC2 Instance State-change Notification"
+          detail: 
+            state: 
+              - "pending"
+              - "running"
+              - "shutting-down"
+              - "terminated"
+        State: "ENABLED"
+        Targets: 
+          - 
+            Arn: 
+              Fn::GetAtt: 
+                - "SecurityLambda"
+                - "Arn"
+            Id: "EC2EventFunction"
+            
+    PermissionForEventsToInvokeLambda: 
+      Type: AWS::Lambda::Permission
+      Properties: 
+        FunctionName: 
+          Ref: "SecurityLambda"
+        Action: "lambda:InvokeFunction"
+        Principal: "events.amazonaws.com"
+        SourceArn: 
+          Fn::GetAtt: 
+            - "EventRule"
+            - "Arn"
+
+#########################################################
+#                                                       # 
+#        Start of Outputs section                       #
+#                                                       #
+#########################################################
+Outputs:
+  S3BucketName:
+    Description: The S3 Bucket Name
+    Value:             
+      Fn::GetAtt: 
+        - "S3Bucket"
+        - "DomainName"
+  CloudWatchLogRoleName:
+    Description: The Cloud Watch Role Name
+    Value: !Ref CloudWatchLogRole
+  CloudWatchLogGroupName:
+    Description: The Cloud Watch Log Group Name
+    Value: !Ref CloudWatchLogGroup
+  SecurityTrailName:
+    Description: The Security Trail Name
+    Value: !Ref SecurityTrail
